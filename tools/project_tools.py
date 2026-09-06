@@ -84,11 +84,12 @@ def project_create(name: str, path: Optional[str] = None, task_id: Optional[str]
         return json.dumps({"success": False, "error": "name is required"})
     from hermes_cli import projects_db as pdb
     folder = (path or "").strip()
-    if folder:
-        folder = os.path.abspath(os.path.expanduser(folder))
+    if not folder:
+        return json.dumps({"success": False, "error": "path is required for create"})
+    folder = os.path.abspath(os.path.expanduser(folder))
     try:
         with pdb.connect_closing() as conn:
-            existing = pdb.find_by_primary_path(conn, folder) if folder else None
+            existing = pdb.find_by_primary_path(conn, folder)
             if existing is not None:
                 # Idempotent create: duplicates would render N identical sidebar subtrees.
                 # Idempotent create: the folder already belongs to a project. Re-activating it beats minting
@@ -96,7 +97,7 @@ def project_create(name: str, path: Optional[str] = None, task_id: Optional[str]
                 pdb.set_active(conn, existing.id)
                 proj = existing
             else:
-                pid = pdb.create_project(conn, name=name, folders=[folder] if folder else [], primary_path=folder or None)
+                pid = pdb.create_project(conn, name=name, folders=[folder], primary_path=folder)
                 pdb.set_active(conn, pid)
                 proj = pdb.get_project(conn, pid)
     except ValueError as exc:
@@ -139,8 +140,8 @@ registry.register(
     schema={
         "name": "desktop_project",
         "description": (
-            "Create or switch desktop Projects (named workspaces). create: one and switch "
-            "this chat into it — pass path to anchor it to a repo/folder (the "
+            "Create or switch desktop Projects (named workspaces). create: one at the required "
+            "repo/folder path and switch this chat into it (the "
             "chat's workspace moves there, the sidebar follows). switch: move "
             "this chat into an existing project by name/slug/id — the "
             "intentional way to move the session, not `cd`. list: all projects + which is active."
@@ -150,7 +151,7 @@ registry.register(
             "properties": {
                 "action": {"type": "string", "enum": ["create", "switch", "list"]},
                 "name": {"type": "string", "description": "create: human name. switch: name, slug, or id."},
-                "path": {"type": "string", "description": "create: repo/folder to anchor to."},
+                "path": {"type": "string", "description": "create: required repo/folder to anchor to."},
             },
             "required": ["action"],
         },
