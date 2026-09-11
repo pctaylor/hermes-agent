@@ -219,12 +219,20 @@ def _generate_row(
             # The invariant: one frame is exactly one whole character. Two
             # figures that touch merge into a single bbox, so the row-level
             # collapse check above cannot see them; this catches them per frame.
-            # A doubled frame is bad art, but a re-roll routinely segments
+            # Anchored to the row's OWN median, not the base silhouette: the
+            # invariant is relative ("heavier / more-cored than its siblings")
+            # and rows legitimately differ in scale, so the base silhouette would
+            # reintroduce the sheet-wide false positive. The collapse check above
+            # keeps the base silhouette on purpose — "uniformly shrunk" IS an
+            # absolute-scale question against the character's true size. A
+            # doubled frame is bad art, but a re-roll routinely segments
             # cleanly — so it takes the NORMAL retry ladder (CollapsedRowError),
             # NOT the skip-strict shortcut UnsegmentableStripError triggers.
-            for index, frame in enumerate(frames):
-                if defects := atlas.frame_defects(frame, reference_size):
-                    raise atlas.CollapsedRowError(f"row {state} frame {index} is not one character: {'; '.join(defects)}")
+            row_reference = atlas.median_reference(frames)
+            if row_reference:
+                for index, frame in enumerate(frames):
+                    if defects := atlas.frame_defects(frame, row_reference[0], row_reference[1]):
+                        raise atlas.CollapsedRowError(f"row {state} frame {index} is not one character: {'; '.join(defects)}")
             logger.info("pet hatch %r: row %r ready in %.1fs (attempt %d)", slug, state, time.monotonic() - t0, attempt + 1)
             return state, frames
         except Exception as exc:  # noqa: BLE001 - retried; one bad row is tolerated

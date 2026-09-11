@@ -67,9 +67,7 @@ _NEAREST = Image.Resampling.NEAREST  # interpolating resamples blur hard pixel-a
 _CORE_ERODE = ImageFilter.MinFilter(3)  # 1px erosion: thin bridges break, bodies survive
 _CORE_RATIO = 0.30  # a surviving core must carry >=30% of the largest to count as a figure
 _CORE_MASS_FLOOR = 24  # ...and enough absolute mass not to be noise/antialiasing
-_AREA_RATIO_LIMIT = 1.30  # opaque mass vs reference-implied mass; one body measures ~0.5-0.9x
-_BBOX_WIDTH_RATIO_LIMIT = 2.8  # cheap early exit only (a wide pose reaches ~1.6x legitimately)
-_BBOX_HEIGHT_RATIO_LIMIT = 1.8  # cheap early exit only (motion envelopes stretch ~1.2x)
+_AREA_RATIO_LIMIT = 1.30  # opaque mass vs what one figure implies; two bodies land >=1.4x
 
 
 def _median(values) -> int:
@@ -506,6 +504,11 @@ def row_frames_collapsed(frames: list, reference_size: tuple[int, int] | None = 
     return None
 
 
+def _frame_bbox(image):
+    """Opaque-silhouette bbox (``_ALPHA_FLOOR``-thresholded), or ``None`` when empty."""
+    return _load_rgba(image).getchannel("A").point(lambda a: 255 if a > _ALPHA_FLOOR else 0).getbbox()
+
+
 def _opaque_mass(image) -> int:
     """Opaque pixel count (alpha above the floor) — bbox-independent, so it counts every figure."""
     return image.convert("RGBA").getchannel("A").point(lambda a: 255 if a > _ALPHA_FLOOR else 0).histogram()[255]
@@ -529,41 +532,68 @@ def _substantial_cores(image) -> int:
     return sum(1 for mass in masses if mass >= floor)
 
 
-def frame_defects(frame, reference_size: tuple[int, int] | None) -> list[str]:
+def median_reference(frames: list) -> tuple[tuple[int, int], int] | None:
+    """Median ``((width, height), opaque_mass)`` of the non-empty *frames*, else ``None``.
+
+    The LOCAL scale anchor for :func:`frame_defects`: a state/row is its own
+    normal. Pet sheets legitimately draw rows at different scales (a jump row is
+    taller, idle smaller), so a sheet-wide reference makes a big row look doubled
+    and a small row look over-tall. Only the per-frame *defect* check is local;
+    the collapse floors keep the sheet-wide median — "is this pet too small" is
+    an absolute-scale question, not a relative one.
+    """
+    boxes, masses = [], []
+    for frame in frames:
+        rgba = _load_rgba(frame)
+        box = _frame_bbox(rgba)
+        if box is None:
+            continue
+        boxes.append(box)
+        masses.append(_opaque_mass(rgba))
+    if not boxes:
+        return None
+    return _median_box_size(boxes), _median(masses)
+
+
+def frame_defects(frame, reference_size: tuple[int, int] | None, reference_mass: int | None = None) -> list[str]:
     """Reasons *frame* is not exactly ONE whole character; empty list means it is.
 
-    ONE home for the invariant that the pipeline judged in four places by four
-    bounding-box proxies (all of which a doubled frame passes, because two
-    figures standing close merge into one box). Detection here counts *figures*,
-    not box width:
+    ONE home for the invariant the pipeline judged in four places by four
+    bounding-box proxies, every one of which a doubled frame passes, because two
+    figures standing close merge into one box. Detection counts *figures*, not
+    box width:
 
     * eroded-core count — one body erodes to one substantial core, two bodies to
-      two, side by side or stacked;
-    * opaque mass against the mass the reference silhouette implies at the
-      frame's height — two bodies ~= 2x, and unlike width it barely moves when a
-      pose puts its arms out;
-    * a bbox envelope test only as a cheap early exit for frames no single pose
-      could produce.
+      two, side by side or stacked. This is the primary signal: reference-free,
+      and the only one that sees a body split into stacked halves whose total
+      mass equals a single body's;
+    * opaque mass — a doubled frame carries ~2x the mass. Compared with the
+      reference figure two independent ways and flagged only when it beats BOTH:
+      the mass the reference silhouette implies at this frame's *height*, and the
+      reference's own mass. One estimate alone false-positives on real art — a
+      wide, short pose is heavy for its height, a big row's cell is heavy for the
+      sheet — so requiring both keeps a normal frame ~1.0x on either.
 
-    *reference_size* is the character's ``(width, height)`` silhouette (the base
-    look, or the atlas-wide median box post-compose). Without a usable one the
-    mass/envelope signals abstain, but the reference-free core count still
-    applies.
+    *reference_size* and *reference_mass* come from :func:`median_reference` of
+    the frame's own row/state. Without a reference the size/mass signals abstain,
+    but the reference-free core count still applies. There is deliberately no bbox
+    width/height envelope: it added nothing over cores + mass and was the
+    false-positive source (a full-size figure in a small row looks "too tall",
+    yet bears the mass of exactly one character).
     """
     rgba = _load_rgba(frame)
-    box = rgba.getchannel("A").point(lambda a: 255 if a > _ALPHA_FLOOR else 0).getbbox()
+    box = _frame_bbox(rgba)
     if box is None:
         return ["frame is empty"]
-    width, height = box[2] - box[0], box[3] - box[1]
     defects: list[str] = []
     if reference_size and reference_size[0] > 0 and reference_size[1] > 0:
         ref_w, ref_h = reference_size
-        if width > ref_w * _BBOX_WIDTH_RATIO_LIMIT or height > ref_h * _BBOX_HEIGHT_RATIO_LIMIT:
-            return [f"frame is {width}x{height}px, outside a {ref_w}x{ref_h}px character's pose envelope"]
+        height = box[3] - box[1]
         mass = _opaque_mass(rgba)
-        expected = ref_w * height * height / ref_h  # bbox area the reference implies at this height
+        implied = ref_w * height * height / ref_h  # the reference silhouette scaled to this frame's height
+        expected = max(implied, reference_mass) if reference_mass else implied
         if mass > expected * _AREA_RATIO_LIMIT:
-            defects.append(f"frame carries {mass}px of opaque mass, ~{mass / expected:.1f}x a single {ref_w}x{ref_h}px character at {height}px tall")
+            defects.append(f"frame carries {mass}px of opaque mass, ~{mass / expected:.1f}x one {ref_w}x{ref_h}px character")
     cores = _substantial_cores(rgba)
     if cores > 1:
         defects.append(f"frame holds {cores} separate figures, not one character")
@@ -772,13 +802,19 @@ def _check_atlas_cells(atlas) -> tuple[list[str], list[str], list[str]]:
         if (global_med_w and global_med_h) and collapsed:
             errors.append(f"state '{state}' appears collapsed (median {med_w}x{med_h}px, global median {global_med_w}x{global_med_h}px)")
     # Compose must not accept what the pre-compose gate rejects: the SAME
-    # invariant runs per cell, anchored to the atlas-wide median box so a
-    # uniformly bad sheet cannot define its own normal.
+    # invariant runs per cell. Anchored to the STATE/ROW median, not the
+    # sheet-wide median — pet sheets legitimately put rows at different scales,
+    # and a sheet-wide reference makes a big row look doubled (homelander,
+    # yy) and a small row look over-tall (scruffy-chipper-upside). The
+    # sheet-wide median still drives the collapse floors above, unchanged.
     for state, cells in cells_by_state.items():
+        reference = median_reference(cells)
+        if reference is None:
+            continue
         for col, cell in enumerate(cells):
             if cell.getbbox() is None:
                 continue
-            for reason in frame_defects(cell, (global_med_w, global_med_h)):
+            for reason in frame_defects(cell, reference[0], reference[1]):
                 errors.append(f"state '{state}' cell {col} {reason}")
     data = atlas.tobytes()
     residue = sum(1 for i in range(3, len(data), 4) if data[i] == 0 and any(data[i - 3 : i]))

@@ -134,9 +134,14 @@ def test_unrelated_segmentation_valueerror_is_not_reclassified(monkeypatch):
 # ``frame_defects`` is the ONE home for the invariant; these are the two
 # morphologies the fleet audit found in the wild (side-by-side duplicates and a
 # body split into stacked halves) plus the legitimate poses it must not reject.
-# The reference is a single 72x100 body in every case.
+# The reference is the frame's OWN row/state median (``median_reference``), not
+# a sheet-wide figure: real sheets put rows at different scales, and a
+# sheet-wide anchor called three legitimately-normal cells doubled/over-tall
+# (homelander, yy, scruffy-chipper-upside). The reference below is a single
+# 72x100 body, i.e. a one-cell row.
 
 FIGURE = (72, 100)
+FIGURE_MASS = 5644  # opaque mass of the single figure ``_blobs(FIGURE, [(0, 0, 71, 99)])``
 
 
 def _blobs(size, boxes):
@@ -149,7 +154,7 @@ def _blobs(size, boxes):
 
 
 def test_frame_defects_accepts_a_single_figure():
-    assert atlas.frame_defects(_blobs((72, 100), [(0, 0, 71, 99)]), FIGURE) == []
+    assert atlas.frame_defects(_blobs((72, 100), [(0, 0, 71, 99)]), FIGURE, FIGURE_MASS) == []
 
 
 def test_frame_defects_rejects_side_by_side_duplicates():
@@ -158,7 +163,7 @@ def test_frame_defects_rejects_side_by_side_duplicates():
     # threshold in the pipeline — the live shy-ghost defect. Counting figures
     # does not merge.
     frame = _blobs((160, 100), [(2, 0, 73, 99), (86, 0, 157, 99)])
-    reasons = atlas.frame_defects(frame, FIGURE)
+    reasons = atlas.frame_defects(frame, FIGURE, FIGURE_MASS)
     assert reasons and any("figures" in reason for reason in reasons)
 
 
@@ -168,7 +173,7 @@ def test_frame_defects_rejects_a_stacked_split_body():
     # ratio cannot see the defect and the bbox is unchanged — the eroded-core
     # count is the signal that survives.
     frame = _blobs((72, 100), [(0, 0, 71, 48), (0, 52, 71, 99)])
-    reasons = atlas.frame_defects(frame, FIGURE)
+    reasons = atlas.frame_defects(frame, FIGURE, FIGURE_MASS)
     assert reasons and any("figures" in reason for reason in reasons)
 
 
@@ -177,7 +182,7 @@ def test_frame_defects_rejects_overlapping_figures_that_erode_into_one_core():
     # under-reports, so the opaque-mass ratio is what catches it (~1.4x a single
     # body) — the two signals cover each other.
     frame = _blobs((124, 100), [(0, 0, 71, 99), (52, 0, 123, 99)])
-    reasons = atlas.frame_defects(frame, FIGURE)
+    reasons = atlas.frame_defects(frame, FIGURE, FIGURE_MASS)
     assert reasons and any("opaque mass" in reason for reason in reasons)
 
 
@@ -186,7 +191,7 @@ def test_frame_defects_accepts_a_wide_pose():
     # this is the false positive the 2.6x/3.0x thresholds were raised to avoid;
     # the invariant must not reintroduce it.
     frame = _blobs((136, 100), [(0, 0, 71, 99), (58, 40, 115, 61), (20, 40, 77, 61)])
-    assert atlas.frame_defects(frame, FIGURE) == []
+    assert atlas.frame_defects(frame, FIGURE, FIGURE_MASS) == []
 
 
 def test_frame_defects_accepts_a_small_detached_lobe():
@@ -194,7 +199,7 @@ def test_frame_defects_accepts_a_small_detached_lobe():
     # code comments rely on it). It erodes to a small core and must not be
     # counted as a second figure.
     frame = _blobs((104, 100), [(0, 0, 69, 99), (86, 30, 101, 69)])
-    assert atlas.frame_defects(frame, FIGURE) == []
+    assert atlas.frame_defects(frame, FIGURE, FIGURE_MASS) == []
 
 
 def test_frame_defects_counts_cores_without_a_reference():
@@ -206,13 +211,55 @@ def test_frame_defects_counts_cores_without_a_reference():
 
 
 def test_frame_defects_flags_an_empty_frame():
-    assert atlas.frame_defects(_frame(10, 10, opaque=False), FIGURE) == ["frame is empty"]
+    assert atlas.frame_defects(_frame(10, 10, opaque=False), FIGURE, FIGURE_MASS) == ["frame is empty"]
+
+
+def test_frame_defects_accepts_a_cell_larger_than_the_sheet_median():
+    # A row drawn at a scale above the sheet-wide median: its normal cells are
+    # legitimately heavier than that median. Anchored to their OWN row they are
+    # ~1.0x and must not be called doubled — the homelander/yy false positive.
+    cell = _blobs((200, 200), [(0, 0, 159, 199)])
+    reference = atlas.median_reference([cell, cell.copy(), cell.copy()])
+    assert reference is not None
+    assert atlas.frame_defects(cell, reference[0], reference[1]) == []
+
+
+def test_frame_defects_accepts_a_cell_smaller_than_the_sheet_median():
+    # The mirror case: a small row's normal cell, well under the sheet median.
+    cell = _blobs((80, 90), [(0, 0, 55, 89)])
+    reference = atlas.median_reference([cell, cell.copy()])
+    assert reference is not None
+    assert atlas.frame_defects(cell, reference[0], reference[1]) == []
+
+
+def test_frame_defects_accepts_a_full_size_figure_in_a_small_row():
+    # scruffy-chipper-upside: a row whose median cell is tiny, holding one
+    # full-size figure. Beside a sheet-wide (small) reference it looked "too
+    # tall" and its mass looked huge; against its own row both signals are ~1.0x
+    # because the mass signal takes the *larger* of the row-implied estimate and
+    # the row median, so a frame is only rejected when it beats BOTH.
+    full = _blobs((200, 200), [(0, 0, 159, 199)])
+    tiny = _blobs((80, 90), [(0, 0, 55, 89)])
+    reference = atlas.median_reference([tiny, tiny.copy(), full])
+    assert reference is not None
+    assert atlas.frame_defects(full, reference[0], reference[1]) == []
+
+
+def test_median_reference_is_the_row_median():
+    # The reference is the row's own median box and mass, so a row is its own
+    # normal — never the sheet-wide figure.
+    small = _blobs((80, 90), [(0, 0, 55, 89)])
+    big = _blobs((200, 200), [(0, 0, 159, 199)])
+    reference = atlas.median_reference([small, small.copy(), big])
+    assert reference is not None
+    assert reference[0] == (56, 90)  # two small cells dominate the median
+    assert reference[1] == atlas._opaque_mass(small)
 
 
 def test_validate_atlas_rejects_a_cell_holding_two_figures():
     # Post-compose wiring: compose must not accept what the pre-compose gate
-    # rejects. One state's cell holds a doubled figure; the rest are single
-    # bodies that define the atlas-wide median reference.
+    # rejects. One state's cell holds a doubled figure; its siblings are single
+    # bodies that define that state's row-median reference.
     def single():
         return _blobs((atlas.CELL_WIDTH, atlas.CELL_HEIGHT), [(60, 40, 131, 139)])
 
@@ -223,4 +270,20 @@ def test_validate_atlas_rejects_a_cell_holding_two_figures():
     result = atlas.validate_atlas(atlas.compose_atlas(states))
     assert not result["ok"]
     assert any("cell 2" in error and "figures" in error for error in result["errors"])
+
+
+def test_validate_atlas_anchors_each_state_to_its_own_scale():
+    # The fleet false positive, end-to-end: real sheets mix a tall-thin row with
+    # a wide-short one. Measured against the SHEET-wide median (the tall-thin
+    # rows) the wide-short row's cells look ~1.4x too heavy and would be rejected
+    # as doubled; anchored to their own row they are ~1.0x and the sheet is
+    # valid. Reverting to a sheet-wide reference fails this test.
+    def cell(box):
+        return _blobs((atlas.CELL_WIDTH, atlas.CELL_HEIGHT), [box])
+
+    states = {}
+    for state, _row, count in atlas.ROW_SPECS:
+        box = (60, 4, 119, 203) if state != "failed" else (60, 44, 209, 163)  # tall-thin vs wide-short
+        states[state] = [cell(box) for _ in range(count)]
+    assert atlas.validate_atlas(atlas.compose_atlas(states))["ok"]
 
