@@ -502,6 +502,58 @@ def test_hatch_pet_retries_row_whose_frames_collapse_to_slivers(monkeypatch, tmp
     assert "sliver" in (atlas_mod.row_frames_collapsed(slivers, atlas_mod.silhouette_box(base)) or "")
 
 
+def test_hatch_pet_retries_a_row_holding_two_figures(monkeypatch, tmp_path):
+    """The invariant at the pre-compose gate: a frame holding two characters —
+    the live shy-ghost defect — is re-rolled. Two figures close together merge
+    into one bbox, so the frame passes every box-based check (subject count and
+    width ratio); counting figures is what catches it. It takes the NORMAL
+    retry ladder, NOT the skip-strict shortcut UnsegmentableStripError
+    triggers, because a fresh roll re-segments cleanly."""
+    from agent.pet.generate import atlas as atlas_mod
+    from agent.pet.generate import imagegen, orchestrate
+
+    base = tmp_path / "base.png"
+    _strip(1).save(base)
+
+    attempts: dict[str, int] = {}
+    idle_methods: list[str] = []
+
+    def fake_generate(prompt, *, n=1, reference_images=None, provider=None, prefix="pet", aspect_ratio="square"):
+        attempts[prefix] = attempts.get(prefix, 0) + 1
+        state = prefix.replace("pet_row_", "")
+        count = dict((s, c) for s, _, c in atlas_mod.ROW_SPECS).get(state, 6)
+        path = tmp_path / f"{prefix}_{attempts[prefix]}.png"
+        _strip(count).save(path)
+        return [path]
+
+    real_extract = atlas_mod.extract_strip_frames
+
+    def doubled_once(strip, count, *args, method="auto", **kwargs):
+        frames = real_extract(strip, count, *args, method=method, **kwargs)
+        name = Path(strip).name if isinstance(strip, (str, Path)) else ""
+        if name.startswith("pet_row_idle"):
+            idle_methods.append(method)
+            if len(idle_methods) == 1:
+                # One frame drawn as TWO figures side by side: merged into one
+                # (barely-wider) bbox, so no box-based check sees it.
+                doubled = Image.new("RGBA", frames[1].size, (0, 0, 0, 0))
+                draw = ImageDraw.Draw(doubled)
+                draw.ellipse((2, 34, 67, 174), fill=(60, 80, 200, 255))
+                draw.ellipse((72, 34, 137, 174), fill=(200, 80, 60, 255))
+                frames[1] = doubled
+        return frames
+
+    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
+    monkeypatch.setattr(imagegen, "generate", fake_generate)
+    monkeypatch.setattr(atlas_mod, "extract_strip_frames", doubled_once)
+
+    result = orchestrate.hatch_pet(base_image=base, slug="double-gate", concept="a fox")
+
+    assert attempts["pet_row_idle"] == 2, "a two-figure frame must be re-rolled, not accepted"
+    assert idle_methods == ["components", "components"], "must keep the strict retry, not skip to lenient"
+    assert "idle" in result.states
+
+
 def test_collapsed_row_keeps_the_normal_retry_ladder(monkeypatch, tmp_path):
     """A collapse is NOT an unsegmentable strip: the strip sliced fine, so a
     fresh roll deserves the normal strict retry. Pins the policy that a

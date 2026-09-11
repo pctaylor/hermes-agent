@@ -216,6 +216,15 @@ def _generate_row(
                 # distinct type keeps the normal retry ladder (a fresh roll can
                 # still segment cleanly) instead of the skip-strict shortcut.
                 raise atlas.CollapsedRowError(f"row {state} collapsed: {collapsed}")
+            # The invariant: one frame is exactly one whole character. Two
+            # figures that touch merge into a single bbox, so the row-level
+            # collapse check above cannot see them; this catches them per frame.
+            # A doubled frame is bad art, but a re-roll routinely segments
+            # cleanly — so it takes the NORMAL retry ladder (CollapsedRowError),
+            # NOT the skip-strict shortcut UnsegmentableStripError triggers.
+            for index, frame in enumerate(frames):
+                if defects := atlas.frame_defects(frame, reference_size):
+                    raise atlas.CollapsedRowError(f"row {state} frame {index} is not one character: {'; '.join(defects)}")
             logger.info("pet hatch %r: row %r ready in %.1fs (attempt %d)", slug, state, time.monotonic() - t0, attempt + 1)
             return state, frames
         except Exception as exc:  # noqa: BLE001 - retried; one bad row is tolerated

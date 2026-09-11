@@ -47,12 +47,12 @@ class UnsegmentableStripError(ValueError):
 
 
 class CollapsedRowError(ValueError):
-    """Sliced frames are slivers of the body rather than whole poses.
+    """Slicing succeeded, but the framing is wrong — frames are slivers of the body, or not exactly one whole character.
 
     Deliberately distinct from :class:`UnsegmentableStripError`: the strip *was*
     sliceable, so a fresh roll deserves a normal retry. Sharing the type would
-    silently give a collapsed row the skip-strict-retries policy, which saves a
-    paid call but never re-rolls the art that caused the collapse.
+    silently give the row the skip-strict-retries policy, which saves a paid call
+    but never re-rolls the art that caused the miss.
     """
 
 
@@ -62,6 +62,14 @@ _NORMALIZE_PAD = 14  # normalized cells fill like real petdex pets (~5px from th
 _SIDE_LOBE_RATIO = 0.18  # adjacent-pose bleed is a small lobe; sizeable lobes (wide poses) survive
 _NEIGHBOURS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 _NEAREST = Image.Resampling.NEAREST  # interpolating resamples blur hard pixel-art edges
+
+# "one frame = exactly one whole character" — see :func:`frame_defects`.
+_CORE_ERODE = ImageFilter.MinFilter(3)  # 1px erosion: thin bridges break, bodies survive
+_CORE_RATIO = 0.30  # a surviving core must carry >=30% of the largest to count as a figure
+_CORE_MASS_FLOOR = 24  # ...and enough absolute mass not to be noise/antialiasing
+_AREA_RATIO_LIMIT = 1.30  # opaque mass vs reference-implied mass; one body measures ~0.5-0.9x
+_BBOX_WIDTH_RATIO_LIMIT = 2.8  # cheap early exit only (a wide pose reaches ~1.6x legitimately)
+_BBOX_HEIGHT_RATIO_LIMIT = 1.8  # cheap early exit only (motion envelopes stretch ~1.2x)
 
 
 def _median(values) -> int:
@@ -498,6 +506,70 @@ def row_frames_collapsed(frames: list, reference_size: tuple[int, int] | None = 
     return None
 
 
+def _opaque_mass(image) -> int:
+    """Opaque pixel count (alpha above the floor) — bbox-independent, so it counts every figure."""
+    return image.convert("RGBA").getchannel("A").point(lambda a: 255 if a > _ALPHA_FLOOR else 0).histogram()[255]
+
+
+def _substantial_cores(image) -> int:
+    """Eroded cores big enough to be a whole figure (specks and detached lobes drop out).
+
+    A cape/tail fragment erodes to a small island and is ignored; a second body
+    erodes to a comparable island and is counted, whether it sits beside or below
+    the first. This is the signal a bounding box cannot supply: two figures
+    touching merge into one box, but not into one eroded core.
+    """
+    rgba = _load_rgba(image)
+    eroded = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+    eroded.putalpha(rgba.getchannel("A").filter(_CORE_ERODE))
+    masses = sorted((mass for _box, mass in _component_boxes(eroded)), reverse=True)
+    if not masses:
+        return 0
+    floor = max(_CORE_MASS_FLOOR, masses[0] * _CORE_RATIO)
+    return sum(1 for mass in masses if mass >= floor)
+
+
+def frame_defects(frame, reference_size: tuple[int, int] | None) -> list[str]:
+    """Reasons *frame* is not exactly ONE whole character; empty list means it is.
+
+    ONE home for the invariant that the pipeline judged in four places by four
+    bounding-box proxies (all of which a doubled frame passes, because two
+    figures standing close merge into one box). Detection here counts *figures*,
+    not box width:
+
+    * eroded-core count — one body erodes to one substantial core, two bodies to
+      two, side by side or stacked;
+    * opaque mass against the mass the reference silhouette implies at the
+      frame's height — two bodies ~= 2x, and unlike width it barely moves when a
+      pose puts its arms out;
+    * a bbox envelope test only as a cheap early exit for frames no single pose
+      could produce.
+
+    *reference_size* is the character's ``(width, height)`` silhouette (the base
+    look, or the atlas-wide median box post-compose). Without a usable one the
+    mass/envelope signals abstain, but the reference-free core count still
+    applies.
+    """
+    rgba = _load_rgba(frame)
+    box = rgba.getchannel("A").point(lambda a: 255 if a > _ALPHA_FLOOR else 0).getbbox()
+    if box is None:
+        return ["frame is empty"]
+    width, height = box[2] - box[0], box[3] - box[1]
+    defects: list[str] = []
+    if reference_size and reference_size[0] > 0 and reference_size[1] > 0:
+        ref_w, ref_h = reference_size
+        if width > ref_w * _BBOX_WIDTH_RATIO_LIMIT or height > ref_h * _BBOX_HEIGHT_RATIO_LIMIT:
+            return [f"frame is {width}x{height}px, outside a {ref_w}x{ref_h}px character's pose envelope"]
+        mass = _opaque_mass(rgba)
+        expected = ref_w * height * height / ref_h  # bbox area the reference implies at this height
+        if mass > expected * _AREA_RATIO_LIMIT:
+            defects.append(f"frame carries {mass}px of opaque mass, ~{mass / expected:.1f}x a single {ref_w}x{ref_h}px character at {height}px tall")
+    cores = _substantial_cores(rgba)
+    if cores > 1:
+        defects.append(f"frame holds {cores} separate figures, not one character")
+    return defects
+
+
 def silhouette_box(image) -> tuple[int, int] | None:
     """``(width, height)`` of the opaque silhouette in *image*, else ``None`` — the identity anchor's proportions."""
     rgba = _load_rgba(image)
@@ -669,11 +741,13 @@ def _check_atlas_cells(atlas) -> tuple[list[str], list[str], list[str]]:
     """Occupancy/collapse/residue checks for a correctly-sized atlas → ``(errors, warnings, filled_states)``."""
     errors, warnings, filled_states = [], [], []
     cell_boxes_by_state: dict[str, list[tuple[int, int, int, int]]] = {}
+    cells_by_state: dict[str, list] = {}
     for state, row, count in ROW_SPECS:
         cells = [atlas.crop((c * CELL_WIDTH, row * CELL_HEIGHT, (c + 1) * CELL_WIDTH, (row + 1) * CELL_HEIGHT)) for c in range(count)]
         if any(sum(cell.getchannel("A").histogram()[1:]) for cell in cells):
             filled_states.append(state)
             cell_boxes_by_state[state] = [bbox for cell in cells if (bbox := cell.getbbox()) is not None]
+            cells_by_state[state] = cells
         else:
             warnings.append(f"state '{state}' has no frames")
 
@@ -697,6 +771,15 @@ def _check_atlas_cells(atlas) -> tuple[list[str], list[str], list[str]]:
         collapsed = med_w < min_w or med_h < min_h
         if (global_med_w and global_med_h) and collapsed:
             errors.append(f"state '{state}' appears collapsed (median {med_w}x{med_h}px, global median {global_med_w}x{global_med_h}px)")
+    # Compose must not accept what the pre-compose gate rejects: the SAME
+    # invariant runs per cell, anchored to the atlas-wide median box so a
+    # uniformly bad sheet cannot define its own normal.
+    for state, cells in cells_by_state.items():
+        for col, cell in enumerate(cells):
+            if cell.getbbox() is None:
+                continue
+            for reason in frame_defects(cell, (global_med_w, global_med_h)):
+                errors.append(f"state '{state}' cell {col} {reason}")
     data = atlas.tobytes()
     residue = sum(1 for i in range(3, len(data), 4) if data[i] == 0 and any(data[i - 3 : i]))
     if residue:

@@ -128,3 +128,99 @@ def test_unrelated_segmentation_valueerror_is_not_reclassified(monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         atlas.extract_strip_frames(_strip_of([140] * 6), 6, method="components")
     assert not isinstance(excinfo.value, atlas.UnsegmentableStripError)
+
+
+# ───────────────── one frame = exactly one whole character ─────────────────
+# ``frame_defects`` is the ONE home for the invariant; these are the two
+# morphologies the fleet audit found in the wild (side-by-side duplicates and a
+# body split into stacked halves) plus the legitimate poses it must not reject.
+# The reference is a single 72x100 body in every case.
+
+FIGURE = (72, 100)
+
+
+def _blobs(size, boxes):
+    """RGBA canvas of *size* with one opaque ellipse per ``(left, top, right, bottom)``."""
+    img = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for i, box in enumerate(boxes):
+        draw.ellipse(box, fill=(60, 80, 200, 255) if i % 2 == 0 else (200, 80, 60, 255))
+    return img
+
+
+def test_frame_defects_accepts_a_single_figure():
+    assert atlas.frame_defects(_blobs((72, 100), [(0, 0, 71, 99)]), FIGURE) == []
+
+
+def test_frame_defects_rejects_side_by_side_duplicates():
+    # Two similar-mass figures at different x. A bbox proxy merges them into one
+    # (merely wide) box, and at ~2.2x the box stays under every 2.6x/3.0x
+    # threshold in the pipeline — the live shy-ghost defect. Counting figures
+    # does not merge.
+    frame = _blobs((160, 100), [(2, 0, 73, 99), (86, 0, 157, 99)])
+    reasons = atlas.frame_defects(frame, FIGURE)
+    assert reasons and any("figures" in reason for reason in reasons)
+
+
+def test_frame_defects_rejects_a_stacked_split_body():
+    # One body split into two stacked halves at the same x (the cuddle-squish
+    # morphology). Together the halves carry the mass of ONE body, so the area
+    # ratio cannot see the defect and the bbox is unchanged — the eroded-core
+    # count is the signal that survives.
+    frame = _blobs((72, 100), [(0, 0, 71, 48), (0, 52, 71, 99)])
+    reasons = atlas.frame_defects(frame, FIGURE)
+    assert reasons and any("figures" in reason for reason in reasons)
+
+
+def test_frame_defects_rejects_overlapping_figures_that_erode_into_one_core():
+    # Two bodies overlapping enough to fuse after erosion. The core count then
+    # under-reports, so the opaque-mass ratio is what catches it (~1.4x a single
+    # body) — the two signals cover each other.
+    frame = _blobs((124, 100), [(0, 0, 71, 99), (52, 0, 123, 99)])
+    reasons = atlas.frame_defects(frame, FIGURE)
+    assert reasons and any("opaque mass" in reason for reason in reasons)
+
+
+def test_frame_defects_accepts_a_wide_pose():
+    # Arms out: 1.6x wider than the reference and still ONE figure. Rejecting
+    # this is the false positive the 2.6x/3.0x thresholds were raised to avoid;
+    # the invariant must not reintroduce it.
+    frame = _blobs((136, 100), [(0, 0, 71, 99), (58, 40, 115, 61), (20, 40, 77, 61)])
+    assert atlas.frame_defects(frame, FIGURE) == []
+
+
+def test_frame_defects_accepts_a_small_detached_lobe():
+    # A cape/tail fragment is a legitimately disconnected island (the slicing
+    # code comments rely on it). It erodes to a small core and must not be
+    # counted as a second figure.
+    frame = _blobs((104, 100), [(0, 0, 69, 99), (86, 30, 101, 69)])
+    assert atlas.frame_defects(frame, FIGURE) == []
+
+
+def test_frame_defects_counts_cores_without_a_reference():
+    # The core count needs no identity anchor: with no reference the size/mass
+    # signals abstain, but a doubled frame is still two figures.
+    doubled = _blobs((160, 100), [(2, 0, 73, 99), (86, 0, 157, 99)])
+    assert atlas.frame_defects(doubled, None) != []
+    assert atlas.frame_defects(_blobs((72, 100), [(0, 0, 71, 99)]), None) == []
+
+
+def test_frame_defects_flags_an_empty_frame():
+    assert atlas.frame_defects(_frame(10, 10, opaque=False), FIGURE) == ["frame is empty"]
+
+
+def test_validate_atlas_rejects_a_cell_holding_two_figures():
+    # Post-compose wiring: compose must not accept what the pre-compose gate
+    # rejects. One state's cell holds a doubled figure; the rest are single
+    # bodies that define the atlas-wide median reference.
+    def single():
+        return _blobs((atlas.CELL_WIDTH, atlas.CELL_HEIGHT), [(60, 40, 131, 139)])
+
+    states = {state: [single() for _ in range(count)] for state, _row, count in atlas.ROW_SPECS}
+    assert atlas.validate_atlas(atlas.compose_atlas(states))["ok"]
+
+    states["idle"][2] = _blobs((atlas.CELL_WIDTH, atlas.CELL_HEIGHT), [(10, 40, 81, 139), (94, 40, 165, 139)])
+    result = atlas.validate_atlas(atlas.compose_atlas(states))
+    assert not result["ok"]
+    assert any("cell 2" in error and "figures" in error for error in result["errors"])
+
